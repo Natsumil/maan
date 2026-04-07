@@ -32,6 +32,7 @@ type RentalRecord = {
   username: string;
   borrowedBy: string;
   borrowedAt: string;
+  reminderSentAt?: string;
 };
 
 type AppState = {
@@ -102,12 +103,15 @@ const STATE_FILE = path.resolve("state.json");
 const EMOJI_FILES_DIR = path.resolve("files");
 const HENRIK_FETCH_TIMEOUT_MS = 15000;
 const RANK_CACHE_TTL_MS = 10 * 60 * 1000;
+const BORROW_REMINDER_DELAY_MS = 6 * 60 * 60 * 1000;
+const BORROW_REMINDER_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 const rankCache = new Map<string, RankCacheEntry>();
 let stateOperationQueue: Promise<void> = Promise.resolve();
 let latestRankedSnapshot: RankedAccountSnapshot | null = null;
 let emojiSnapshot: EmojiSnapshot | null = null;
 const EMOJI_CACHE_TTL_MS = 30 * 60 * 1000;
+let reminderCheckInProgress = false;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
@@ -149,7 +153,15 @@ async function ensureState(): Promise<AppState> {
     return {
       panelChannelId: parsed.panelChannelId,
       panelMessageId: parsed.panelMessageId,
-      rentals: Array.isArray(parsed.rentals) ? parsed.rentals : [],
+      rentals: Array.isArray(parsed.rentals)
+        ? parsed.rentals.map((rental) => ({
+            username: rental.username ?? "",
+            borrowedBy: rental.borrowedBy ?? "",
+            borrowedAt: rental.borrowedAt ?? "",
+            reminderSentAt:
+              typeof rental.reminderSentAt === "string" ? rental.reminderSentAt : undefined,
+          }))
+        : [],
       history: Array.isArray(parsed.history) ? parsed.history : [],
     };
   } catch (error) {
@@ -228,6 +240,31 @@ async function sendLogMessage(content: string): Promise<void> {
     }
   } catch (error) {
     console.error("Failed to send log message:", error);
+  }
+}
+
+async function sendTextMessage(channelId: string, content: string): Promise<boolean> {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (channel?.isTextBased() && "send" in channel) {
+      await channel.send(content);
+      return true;
+    }
+  } catch (error) {
+    console.error("Failed to send text message:", error);
+  }
+
+  return false;
+}
+
+async function sendDirectMessage(userId: string, content: string): Promise<boolean> {
+  try {
+    const user = await client.users.fetch(userId);
+    await user.send(content);
+    return true;
+  } catch (error) {
+    console.error("Failed to send direct message:", error);
+    return false;
   }
 }
 
@@ -315,6 +352,11 @@ function containsLineBreak(value: string): boolean {
 }
 
 function formatBorrowedAtRelative(isoDate: string): string {
+  const unixSeconds = Math.floor(new Date(isoDate).getTime() / 1000);
+  return `<t:${unixSeconds}:R>`;
+}
+
+function formatTimestampRelative(isoDate: string): string {
   const unixSeconds = Math.floor(new Date(isoDate).getTime() / 1000);
   return `<t:${unixSeconds}:R>`;
 }
@@ -613,6 +655,60 @@ function buildChunkedFields(name: string, lines: string[]): Array<{ name: string
     name: index === 0 ? name : `${name} (${index + 1})`,
     value: chunk,
   }));
+}
+
+async function checkBorrowReminders(): Promise<void> {
+  if (reminderCheckInProgress) {
+    return;
+  }
+
+  reminderCheckInProgress = true;
+
+  try {
+    const state = await ensureState();
+    const accounts = await loadAccounts();
+    const accountMap = new Map(accounts.map((account) => [account.username, account]));
+    const now = Date.now();
+    const overdueRentals = state.rentals.filter((rental) => {
+      if (rental.reminderSentAt) {
+        return false;
+      }
+
+      const borrowedAt = new Date(rental.borrowedAt).getTime();
+      return Number.isFinite(borrowedAt) && now - borrowedAt >= BORROW_REMINDER_DELAY_MS;
+    });
+
+    for (const rental of overdueRentals) {
+      const account = accountMap.get(rental.username);
+      const displayName = account ? getDisplayName(account) : rental.username;
+      const content = `<@${rental.borrowedBy}> \`${displayName}\` を借りてから ${formatTimestampRelative(rental.borrowedAt)} です。返却を忘れていないか確認してください。`;
+      const sent = await sendDirectMessage(
+        rental.borrowedBy,
+        `\`${displayName}\` を借りてから ${formatTimestampRelative(rental.borrowedAt)} です。返却を忘れていないか確認してください。`,
+      );
+
+      if (sent) {
+        await updateState(async (latestState) => {
+          const latestRental = latestState.rentals.find(
+            (item) =>
+              item.username === rental.username &&
+              item.borrowedBy === rental.borrowedBy &&
+              item.borrowedAt === rental.borrowedAt,
+          );
+
+          if (latestRental && !latestRental.reminderSentAt) {
+            latestRental.reminderSentAt = new Date().toISOString();
+          }
+        });
+      } else {
+        runDetached(async () => {
+          await sendLogMessage(`DM通知失敗 | \`${displayName}\` | <@${rental.borrowedBy}>`);
+        });
+      }
+    }
+  } finally {
+    reminderCheckInProgress = false;
+  }
 }
 
 function parseRiotId(gameId: string): { name: string; tag: string } | null {
@@ -969,6 +1065,7 @@ async function handleBorrowSelect(interaction: StringSelectMenuInteraction): Pro
       username,
       borrowedBy: interaction.user.id,
       borrowedAt: borrowTimestamp,
+      reminderSentAt: undefined,
     });
     addHistoryRecord(state, {
       action: "borrow",
@@ -1031,6 +1128,10 @@ client.once(Events.ClientReady, async (readyClient) => {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
   await ensureState();
+  runDetached(checkBorrowReminders);
+  setInterval(() => {
+    runDetached(checkBorrowReminders);
+  }, BORROW_REMINDER_CHECK_INTERVAL_MS);
   console.log(`${readyClient.user.tag} is ready.`);
 });
 
