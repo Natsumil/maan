@@ -6,6 +6,7 @@ import {
   ButtonStyle,
   ChatInputCommandInteraction,
   Client,
+  DiscordAPIError,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
@@ -72,6 +73,11 @@ type RankedAccountSnapshot = {
   rankMap: Map<string, RankQueryResult>;
 };
 
+type EmojiSnapshot = {
+  fetchedAt: number;
+  emojis: Map<string, string>;
+};
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -99,6 +105,9 @@ const RANK_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const rankCache = new Map<string, RankCacheEntry>();
 let stateOperationQueue: Promise<void> = Promise.resolve();
+let latestRankedSnapshot: RankedAccountSnapshot | null = null;
+let emojiSnapshot: EmojiSnapshot | null = null;
+const EMOJI_CACHE_TTL_MS = 30 * 60 * 1000;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
@@ -220,6 +229,12 @@ async function sendLogMessage(content: string): Promise<void> {
   } catch (error) {
     console.error("Failed to send log message:", error);
   }
+}
+
+function runDetached(task: () => Promise<void>): void {
+  void task().catch((error) => {
+    console.error("Detached task failed:", error);
+  });
 }
 
 function normalizeEmojiName(fileName: string): string {
@@ -382,6 +397,28 @@ function formatRankForPanel(rankDetails: RankDetails | null, emojiMentionResolve
   return emoji || fallbackEmoji;
 }
 
+async function getEmojiMentionMap(forceRefresh = false): Promise<Map<string, string>> {
+  const now = Date.now();
+  if (!forceRefresh && emojiSnapshot && now - emojiSnapshot.fetchedAt < EMOJI_CACHE_TTL_MS) {
+    return emojiSnapshot.emojis;
+  }
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const emojis = await guild.emojis.fetch();
+  const map = new Map<string, string>();
+
+  for (const emoji of emojis.values()) {
+    map.set(emoji.name, `<:${emoji.name}:${emoji.id}>`);
+  }
+
+  emojiSnapshot = {
+    fetchedAt: now,
+    emojis: map,
+  };
+
+  return map;
+}
+
 async function getRankResult(
   account: Account,
   options?: { forceRefresh?: boolean },
@@ -408,15 +445,14 @@ async function buildPanelEmbed(
   state: AppState,
   options?: { forceRefresh?: boolean },
 ): Promise<EmbedBuilder> {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const emojis = await guild.emojis.fetch();
+  const emojis = await getEmojiMentionMap(options?.forceRefresh ?? false);
   const emojiMentionResolver = (emojiName: string): string => {
     const normalized = normalizeEmojiName(emojiName);
-    const emoji = emojis.find((item) => item.name === normalized);
-    return emoji ? `<:${emoji.name}:${emoji.id}>` : "";
+    return emojis.get(normalized) ?? "";
   };
 
   const { sortedAccounts, rankMap } = await sortAccountsByRank(accounts, options);
+  latestRankedSnapshot = { sortedAccounts, rankMap };
 
   const usingNow = sortedAccounts
     .filter((account) => findRental(state, account.username))
@@ -790,7 +826,8 @@ async function handleUploadRankEmojisCommand(
 
 async function handleHistoryCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   const state = await ensureState();
-  const { sortedAccounts } = await sortAccountsByRank(await loadAccounts());
+  const sortedAccounts =
+    latestRankedSnapshot?.sortedAccounts ?? (await sortAccountsByRank(await loadAccounts())).sortedAccounts;
   const lines = sortedAccounts.map((account) => {
     const latestBorrow = state.history.find(
       (entry) => entry.action === "borrow" && entry.username === account.username,
@@ -818,28 +855,30 @@ async function handleHistoryCommand(interaction: ChatInputCommandInteraction): P
 }
 
 async function handleBorrowButton(interaction: ButtonInteraction): Promise<void> {
-  const { sortedAccounts: accounts } = await sortAccountsByRank(await loadAccounts());
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const accounts =
+    latestRankedSnapshot?.sortedAccounts ?? (await sortAccountsByRank(await loadAccounts())).sortedAccounts;
   const state = await ensureState();
 
   if (findRentalByUser(state, interaction.user.id)) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "すでにアカウントを借りています。先に返却してください。",
-      flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
-  await interaction.reply({
+  await interaction.editReply({
     content: "借りるアカウントを選択してください。",
     components: [buildBorrowMenu(accounts, state, interaction.user.id)],
-    flags: MessageFlags.Ephemeral,
   });
 }
 
 async function handleReturnButton(interaction: ButtonInteraction): Promise<void> {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const { sortedAccounts: accounts } = await sortAccountsByRank(await loadAccounts());
+  const accounts =
+    latestRankedSnapshot?.sortedAccounts ?? (await sortAccountsByRank(await loadAccounts())).sortedAccounts;
   const currentState = await ensureState();
   const myRental = findRentalByUser(currentState, interaction.user.id);
 
@@ -883,22 +922,15 @@ async function handleReturnButton(interaction: ButtonInteraction): Promise<void>
     return;
   }
 
-  const sideEffectErrors: string[] = [];
-  try {
-    await refreshPanel();
-  } catch {
-    sideEffectErrors.push("パネル更新");
-  }
-  try {
-    await sendLogMessage(`返却 | \`${getDisplayName(account)}\` | <@${interaction.user.id}> | ${formatTimestamp(returnTimestamp)}`);
-  } catch {
-    sideEffectErrors.push("ログ送信");
-  }
   await interaction.editReply({
-    content:
-      sideEffectErrors.length > 0
-        ? `\`${getDisplayName(account)}\` を返却しました。\n補足: ${sideEffectErrors.join("・")} に失敗しました。`
-        : `\`${getDisplayName(account)}\` を返却しました。`,
+    content: `\`${getDisplayName(account)}\` を返却しました。`,
+  });
+
+  runDetached(async () => {
+    await refreshPanel();
+  });
+  runDetached(async () => {
+    await sendLogMessage(`返却 | \`${getDisplayName(account)}\` | <@${interaction.user.id}> | ${formatTimestamp(returnTimestamp)}`);
   });
 }
 
@@ -1053,6 +1085,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     }
   } catch (error) {
     console.error(error);
+
+    if (error instanceof DiscordAPIError && error.code === 10062) {
+      return;
+    }
 
     const content =
       error instanceof Error ? `エラーが発生しました: ${error.message}` : "エラーが発生しました。";
