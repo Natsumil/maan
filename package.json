@@ -1,0 +1,22 @@
+{
+  "name": "maan",
+  "version": "1.0.0",
+  "description": "Discord account rental panel bot",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "tsx main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@types/node": "^25.5.2",
+    "discord.js": "^14.26.2",
+    "dotenv": "^17.4.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
