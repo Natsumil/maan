@@ -515,11 +515,13 @@ async function buildPanelEmbed(
       return `${rankText} \`${displayName}\``;
     });
 
-  const embed = new EmbedBuilder().setColor(0x2b2d31).setDescription(`空き ${available.length} ・ 利用中 ${usingNow.length}`);
-  const availableFields = buildChunkedFields("利用可能", available.length > 0 ? available : ["なし"]);
-  const usingFields = buildChunkedFields("貸出中", usingNow.length > 0 ? usingNow : ["なし"]);
-
-  return embed.addFields([...availableFields, ...usingFields]);
+  return new EmbedBuilder()
+    .setColor(0x2b2d31)
+    .setDescription(`空き ${available.length} ・ 利用中 ${usingNow.length}`)
+    .addFields(
+      ...buildChunkedFields("利用可能", available.length > 0 ? available : ["なし"], 1024),
+      ...buildChunkedFields("貸出中", usingNow.length > 0 ? usingNow : ["なし"], 1024),
+    );
 }
 
 function buildPanelComponents() {
@@ -649,10 +651,13 @@ function chunkLines(lines: string[], maxLength: number): string[] {
   return chunks;
 }
 
-function buildChunkedFields(name: string, lines: string[]): Array<{ name: string; value: string }> {
-  const chunks = chunkLines(lines, 1000);
-  return chunks.map((chunk, index) => ({
-    name: index === 0 ? name : `${name} (${index + 1})`,
+function buildChunkedFields(
+  label: string,
+  lines: string[],
+  maxLength: number,
+): Array<{ name: string; value: string; inline?: boolean }> {
+  return chunkLines(lines, maxLength).map((chunk, index) => ({
+    name: index === 0 ? label : `${label} (${index + 1})`,
     value: chunk,
   }));
 }
