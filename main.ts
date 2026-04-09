@@ -136,6 +136,13 @@ const commands = [
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
+    .setName("account-delete")
+    .setDescription("accounts.txt からアカウントを削除します。")
+    .addStringOption((option) =>
+      option.setName("username").setDescription("削除するユーザー名").setRequired(true),
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
     .setName("upload-emojis")
     .setDescription("files フォルダから未登録の絵文字だけをこのGuildにアップロードします。")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
@@ -221,6 +228,39 @@ async function loadAccounts(): Promise<Account[]> {
 async function appendAccount(account: Account): Promise<void> {
   const line = `${account.username}:${account.password}:${account.gameId}\n`;
   await fs.appendFile(ACCOUNTS_FILE, line, "utf8");
+}
+
+async function removeAccount(username: string): Promise<boolean> {
+  const raw = await fs.readFile(ACCOUNTS_FILE, "utf8");
+  const lines = raw.split(/\r?\n/);
+  let removed = false;
+
+  const nextLines = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) {
+      return true;
+    }
+
+    const parts = line.split(":");
+    if (parts.length === 3 && parts[0] === username) {
+      removed = true;
+      return false;
+    }
+
+    return true;
+  });
+
+  if (!removed) {
+    return false;
+  }
+
+  let output = nextLines.join("\n");
+  if (output.length > 0 && !output.endsWith("\n")) {
+    output += "\n";
+  }
+
+  await fs.writeFile(ACCOUNTS_FILE, output, "utf8");
+  return true;
 }
 
 function addHistoryRecord(state: AppState, record: HistoryRecord): void {
@@ -896,6 +936,65 @@ async function handleAccountAddCommand(interaction: ChatInputCommandInteraction)
   });
 }
 
+async function handleAccountDeleteCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const username = interaction.options.getString("username", true).trim();
+
+  if (username.length === 0 || username.includes(":") || containsLineBreak(username)) {
+    await interaction.reply({
+      content: "username は空欄不可で、改行とコロン `:` は使えません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const accounts = await loadAccounts();
+  const account = accounts.find((item) => item.username === username);
+  if (!account) {
+    await interaction.reply({
+      content: `\`${username}\` は登録されていません。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const removed = await removeAccount(username);
+  if (!removed) {
+    await interaction.reply({
+      content: `\`${username}\` の削除に失敗しました。もう一度お試しください。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const stateResult = await updateState(async (state) => {
+    const removedRental = findRental(state, username);
+    state.rentals = state.rentals.filter((record) => record.username !== username);
+    return { removedRental };
+  });
+
+  await refreshPanel();
+
+  const lines = [`\`${getDisplayName(account)}\` を accounts.txt から削除しました。`];
+  if (stateResult.removedRental) {
+    lines.push(
+      `貸出状態も解除しました。対象ユーザー: <@${stateResult.removedRental.borrowedBy}>`,
+    );
+  }
+
+  await interaction.reply({
+    content: lines.join("\n"),
+    flags: MessageFlags.Ephemeral,
+  });
+
+  runDetached(async () => {
+    const logLines = [`削除 | \`${getDisplayName(account)}\` | 実行者: <@${interaction.user.id}>`];
+    if (stateResult.removedRental) {
+      logLines.push(`貸出解除: <@${stateResult.removedRental.borrowedBy}>`);
+    }
+    await sendLogMessage(logLines.join(" | "));
+  });
+}
+
 async function handleUploadRankEmojisCommand(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
@@ -1150,6 +1249,11 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 
       if (interaction.commandName === "account-add") {
         await handleAccountAddCommand(interaction);
+        return;
+      }
+
+      if (interaction.commandName === "account-delete") {
+        await handleAccountDeleteCommand(interaction);
         return;
       }
 
