@@ -146,25 +146,10 @@ const commands = [
         .setName("add")
         .setDescription("accounts.txt にアカウントを追加します。")
         .addStringOption((option) =>
-          option.setName("id").setDescription("アカウントID").setRequired(true),
-        )
-        .addStringOption((option) =>
-          option.setName("password").setDescription("パスワード").setRequired(true),
-        )
-        .addStringOption((option) =>
-          option.setName("name").setDescription("表示名").setRequired(true),
-        )
-        .addStringOption((option) =>
-          option.setName("level").setDescription("レベル").setRequired(false),
-        )
-        .addStringOption((option) =>
-          option.setName("rank").setDescription("ランク").setRequired(false),
-        )
-        .addIntegerOption((option) =>
           option
-            .setName("unixtime")
-            .setDescription("最終アクティブの unixtime。省略時は現在時刻")
-            .setRequired(false),
+            .setName("entry")
+            .setDescription("id:pass:name:level:rank:unixTime の1行")
+            .setRequired(true),
         ),
     )
     .addSubcommand((subcommand) =>
@@ -1066,6 +1051,10 @@ function formatRankLabel(rank: string): string {
   return titleCaseRankText(trimmed);
 }
 
+function formatInventoryCount(value: number, width: number): string {
+  return String(value).padStart(width, " ");
+}
+
 function getRankGroups(accounts: Account[], state: AppState) {
   const loaned = getLoanedAccountIds(state);
   const groups = new Map<
@@ -1132,11 +1121,22 @@ async function buildPanelEmbed(
     0,
   );
   const totalCount = groups.reduce((sum, [, group]) => sum + group.totalAccounts, 0);
+  const labelWidth = Math.max(...groups.map(([, group]) => group.label.length));
+  const countWidth = Math.max(
+    2,
+    ...groups.flatMap(([, group]) => [
+      String(group.availableAccounts.length).length,
+      String(group.totalAccounts).length,
+    ]),
+  );
 
   const lines = groups.map(([rankKey, group]) => {
     const emoji = resolveRankEmoji(rankKey, emojis);
+    const label = group.label.padEnd(labelWidth, " ");
+    const available = formatInventoryCount(group.availableAccounts.length, countWidth);
+    const total = formatInventoryCount(group.totalAccounts, countWidth);
     const prefix = emoji ? `${emoji} ` : "";
-    return `${prefix}**${group.label}**: 在庫 ${group.availableAccounts.length} / 総数 ${group.totalAccounts}`;
+    return `${prefix}\`${label}  ${available} / ${total}\``;
   });
 
   return new EmbedBuilder()
@@ -1252,29 +1252,23 @@ async function handlePanelCommand(interaction: ChatInputCommandInteraction): Pro
 
 async function handleAccountAddCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   try {
-    const id = ensureAccountValue("id", interaction.options.getString("id", true));
-    const password = ensureAccountValue("password", interaction.options.getString("password", true));
-    const name = ensureAccountValue("name", interaction.options.getString("name", true));
-    const level = ensureOptionalAccountValue("level", interaction.options.getString("level"));
-    const rank = ensureOptionalAccountValue("rank", interaction.options.getString("rank"));
-    const unixTime = normalizeInteger(
-      interaction.options.getInteger("unixtime") ?? Math.floor(Date.now() / 1000),
-    );
+    const entry = interaction.options.getString("entry", true).trim();
+    const [account] = parseAccountsText(entry, "/account add");
 
     const accounts = await loadAccounts();
-    if (accounts.some((account) => account.id === id)) {
+    if (account.id.trim().length > 0 && accounts.some((item) => item.id === account.id)) {
       await interaction.reply({
-        content: `\`${id}\` はすでに登録されています。`,
+        content: `\`${account.id}\` はすでに登録されています。`,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
 
-    await appendAccount({ key: "", id, password, name, level, rank, unixTime });
+    await appendAccount(account);
     await refreshPanel();
 
     await interaction.reply({
-      content: `\`${name}\` を accounts.txt に追加しました。`,
+      content: `\`${getAccountTitle(account)}\` を accounts.txt に追加しました。`,
       flags: MessageFlags.Ephemeral,
     });
   } catch (error) {
